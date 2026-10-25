@@ -1,14 +1,18 @@
 name: CI Node.js
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Test file to run instead of the full suite (e.g. test/test-fp.js)'
+        required: false
+        default: ''
 
 jobs:
   test:
     name: Node.js ${{ matrix.node-version }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     
     strategy:
       fail-fast: false
@@ -58,4 +62,82 @@ jobs:
       run: npm install
       
     - name: Run Validate
-      run: npm run validate
+      run: |
+        if [ -n "${{ inputs.test-filter }}" ]; then
+          npm run build && node ${{ inputs.test-filter }}
+        else
+          npm run validate
+        fi
+
+  # The lodash-es tarball is not `npm pack` of this repo: it is the
+  # `lodash modularize exports="es"` output of lodash-cli, generated from this repo's lodash.js.
+  pack:
+    name: Pack lodash-es
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js 24
+      uses: actions/setup-node@v4
+      with:
+        node-version: '24'
+
+    - name: Generate lodash-es modules with lodash-cli
+      run: |
+        set -eo pipefail
+        node -v; npm -v
+        CLI="$RUNNER_TEMP/lodash-cli"
+        # Last lodash-cli commit before the 4.17.23 release ("Bump to v4.17.21").
+        git clone --quiet https://github.com/lodash-archive/lodash-cli.git "$CLI"
+        git -C "$CLI" checkout --quiet 51b58c4ecca7c9d7f8ae1d5ab50bb0787b5bc7d8
+        (cd "$CLI" && npm install --omit=dev --ignore-scripts --no-audit --no-fund)
+        # lodash-cli writes each module's imports from its hard-coded lib/mapping.js and only
+        # prunes unused entries, never adds missing ones. The CVE-2026-4800 fix switches
+        # `_.template` from assignInWith to assignWith + arrayEach (lodash-cli 793ef1c), so the
+        # mapping lists both sets; without it template.js throws
+        # `ReferenceError: assignWith is not defined` (lodash issue #6167).
+        MAPPING="$CLI/lib/mapping.js"
+        sed -i "s/^  'template': \['customDefaultsAssignIn', 'assignInWith', /  'template': ['arrayEach', 'customDefaultsAssignIn', 'assignInWith', 'assignWith', /" "$MAPPING"
+        grep -q "^  'template': \['arrayEach', 'customDefaultsAssignIn', 'assignInWith', 'assignWith', 'attempt', 'baseValues', 'escapeStringChar', 'isError', 'isIterateeCall', 'keys', 'toString'\]," "$MAPPING"
+        # lodash-cli resolves its source via require('lodash'): point it at this repo's lodash.js.
+        rm -rf "$CLI/node_modules/lodash"
+        mkdir -p "$CLI/node_modules/lodash"
+        cp lodash.js "$CLI/node_modules/lodash/lodash.js"
+        # The published lodash-es _baseOrderBy.js has no `;` after the inner
+        # `return function(value) {...}`. Drop it only in lodash-cli's input copy: this repo's
+        # lodash.js keeps the `;` that its own jscs `requireSemicolons` style gate (npm run validate)
+        # requires. Fail if the line was not found.
+        sed -i '/^              return baseGet(value, iteratee.length === 1 ? iteratee\[0\] : iteratee);$/{n;s/^            };$/            }/}' "$CLI/node_modules/lodash/lodash.js"
+        grep -A1 -F 'return baseGet(value, iteratee.length === 1 ? iteratee[0] : iteratee);' "$CLI/node_modules/lodash/lodash.js" | grep -qx '            }'
+        echo '{"name":"lodash","version":"4.17.23","main":"lodash.js"}' > "$CLI/node_modules/lodash/package.json"
+        mkdir -p "$RUNNER_TEMP/art"
+        cd "$RUNNER_TEMP/art"
+        node "$CLI/bin/lodash" modularize exports=es -o ./
+
+    - name: Add package files and pack
+      run: |
+        set -eo pipefail
+        cp LICENSE "$RUNNER_TEMP/art/"
+        cp npm-extras/lodash-es/* "$RUNNER_TEMP/art/"
+        mkdir -p seal-dist
+        cd "$RUNNER_TEMP/art"
+        ls | wc -l
+        npm pack --pack-destination "$GITHUB_WORKSPACE/seal-dist"
+        ls -l "$GITHUB_WORKSPACE"/seal-dist
+
+    - name: Smoke-test packed ESM modules
+      run: |
+        set -eo pipefail
+        mkdir -p "$RUNNER_TEMP/packed"
+        tar -xzf seal-dist/lodash-es-*.tgz -C "$RUNNER_TEMP/packed"
+        node .github/seal/esm-smoke.mjs "$RUNNER_TEMP/packed/package" lodash.js
+
+    - name: Upload lodash-es tarball
+      uses: actions/upload-artifact@v4
+      with:
+        name: lodash-es
+        path: seal-dist/lodash-es-*.tgz
+        if-no-files-found: error

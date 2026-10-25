@@ -1,11 +1,7 @@
 name: CI Docs
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    # Run on every PR, regardless of branch
-    branches: [ '*' ]
+  workflow_dispatch:
 
 jobs:
   test-docs:
